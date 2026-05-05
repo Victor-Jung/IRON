@@ -57,6 +57,43 @@ from iron.operators.gemv.op import GEMV
 from iron.operators.gemv.reference import generate_golden_reference
 
 
+def _patch_trace_parser_unbound_cycles_bug():
+    """Workaround upstream bug in mlir_aie/utils/trace/parse.py:
+    `cycles` is referenced before assignment when a stream's first command
+    is `Repeat` (no preceding `Single`/`Multiple` to bind `cycles`).  We
+    inject the initial bindings into convert_commands_to_json's __globals__
+    via a wrapper that pre-assigns sane defaults before delegating.
+    """
+    from aie.utils.trace import parse as _parse
+
+    if getattr(_parse, "_iron_cycles_patched", False):
+        return
+    original = _parse.convert_commands_to_json
+
+    def patched(trace_events, commands, pid_events, events_module):
+        # Re-implement the outer loop with cycles/multiple_list/event
+        # initialized; delegate per-stream to the upstream function via a
+        # tiny shim that pre-pends a no-op "Single" command if the first is
+        # a Repeat (cheapest fix that keeps upstream semantics).
+        for tt, byte_stream_dict in enumerate(commands):
+            for loc, cmds in list(byte_stream_dict.items()):
+                if cmds and "Repeat" in cmds[0].get("type", ""):
+                    # Inject a synthetic zero-length Single so cycles=0,
+                    # event=None get bound without producing visible events.
+                    byte_stream_dict[loc] = [
+                        {"type": "Single", "event": "0", "cycles": "0"}
+                    ] + cmds
+        return original(trace_events, commands, pid_events, events_module)
+
+    _parse.convert_commands_to_json = patched
+    # parse_trace imported convert_commands_to_json at module scope; rebind there too.
+    _parse.parse_trace.__globals__["convert_commands_to_json"] = patched
+    _parse._iron_cycles_patched = True
+
+
+_patch_trace_parser_unbound_cycles_bug()
+
+
 def shape_to_tuple(s):
     return s if isinstance(s, tuple) else (int(s),)
 
@@ -152,7 +189,14 @@ def time_and_trace(
     if not physical_mlir.exists():
         raise RuntimeError(f"lowered MLIR not found at {physical_mlir}")
     mlir_copy.write_text(physical_mlir.read_text())
-    cfg.trace_to_json(str(mlir_copy), str(trace_json))
+    parse_error = None
+    try:
+        cfg.trace_to_json(str(mlir_copy), str(trace_json))
+    except Exception as e:
+        parse_error = e
+        # Write a minimal placeholder JSON so the rest of the pipeline doesn't
+        # NPE on a missing file; the raw .txt is still the source of truth.
+        trace_json.write_text("[]")
 
     # Integrate duration per event name from B/E pairs (counts are misleading
     # because LOCK_STALL events last thousands of cycles each while INSTR_VECTOR
@@ -197,6 +241,7 @@ def time_and_trace(
         "trace_span_cycles": trace_span,
         "correctness": correctness,
         "n_warmup": n_warmup,
+        "parse_error": parse_error,
     }
 
 
@@ -324,6 +369,11 @@ def main() -> int:
 
     print(f"\nResults ({info['npu_us']:.1f} us, after {info['n_warmup']} warmup runs):")
     print(f"  correctness: {info['correctness']}")
+    if info.get("parse_error") is not None:
+        print(f"  WARNING: trace JSON parse failed: {info['parse_error']!r}")
+        print(f"           raw trace at {info['trace_txt']} is still valid; "
+              "duration stats below are based on whatever the parser managed "
+              "to emit.")
     print(f"  per-core effective BW: {eff_bw_per_core:.1f} GB/s")
     print(f"  trace span: {span} cycles "
           f"(~{span/info['npu_us']:.1f} cycles/us)")
