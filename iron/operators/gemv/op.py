@@ -37,6 +37,13 @@ class GEMV(MLIROperator):
     # traffic onto col 0's shim, which collides with col 0's data DMAs).
     # Default 0 keeps the production behavior.
     col_offset: int = field(default=0, repr=False)
+    # When True, link mv_nocompute.cc instead of mv.cc -- same kernel
+    # symbol names and call signatures, but the bodies are no-ops.  The
+    # FIFO acquire/release / DMA pattern is unchanged, so this measures
+    # the *structural* DMA bandwidth ceiling of the GEMV data layout.
+    # Output is meaningless under this flag (correctness check should be
+    # skipped by the caller).
+    compute_disabled: bool = field(default=False, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -67,9 +74,12 @@ class GEMV(MLIROperator):
     def get_mlir_artifact(self):
         mlir_verbose = getattr(self.context, "mlir_verbose", False)
 
+        # When compute is disabled, use a different .o name so artifact
+        # caching doesn't collide with the real GEMV kernel.
+        suffix = "_nocompute" if self.compute_disabled else ""
         kwargs = {
             "verbose": mlir_verbose,
-            "kernel_object": f"gemv_{self.K}k_{self.kernel_vector_size}vs.o",
+            "kernel_object": f"gemv_{self.K}k_{self.kernel_vector_size}vs{suffix}.o",
         }
         if self.trace_size > 0:
             kwargs["trace_size"] = self.trace_size
@@ -96,12 +106,14 @@ class GEMV(MLIROperator):
         )
 
     def get_kernel_artifacts(self):
+        suffix = "_nocompute" if self.compute_disabled else ""
+        source_file = "mv_nocompute.cc" if self.compute_disabled else "mv.cc"
         return [
             KernelObjectArtifact(
-                f"gemv_{self.K}k_{self.kernel_vector_size}vs.o",
+                f"gemv_{self.K}k_{self.kernel_vector_size}vs{suffix}.o",
                 dependencies=[
                     SourceArtifact(
-                        self.context.base_dir / "aie_kernels" / "generic" / "mv.cc"
+                        self.context.base_dir / "aie_kernels" / "generic" / source_file
                     )
                 ],
                 extra_flags=[

@@ -135,6 +135,7 @@ def time_and_trace(
     n_warmup: int = 3,
     rel_tol: float = 0.04,
     abs_tol: float = 1e-3,
+    skip_correctness: bool = False,
 ) -> dict:
     """Compile, warm up, run with TraceConfig, verify correctness, dump trace JSON."""
     op.compile()
@@ -170,20 +171,23 @@ def time_and_trace(
     # Functional correctness: after extract_trace_from_args (run inside
     # load_and_run when ddr_id=-1), args[-1] is a numpy bf16 array of the
     # original C shape -- the actual NPU output.
-    nb = op.num_batches
-    actual = args[-1]  # numpy array, dtype bfloat16
-    if nb > 1:
-        actual = actual.reshape(nb, op.M)[0]  # all batches identical
-    expected = golden["C"]  # torch.bfloat16, shape (M,)
-    errors = verify_buffer(
-        torch.from_numpy(actual.view(np.uint16)).view(torch.bfloat16),
-        "C",
-        expected,
-        rel_tol=rel_tol,
-        abs_tol=abs_tol,
-        max_error_rate=0.001,  # bf16 dot-product accumulation can have a few outliers
-    )
-    correctness = "PASS" if not errors else f"FAIL ({len(errors)} mismatches)"
+    if skip_correctness:
+        correctness = "SKIPPED (compute disabled)"
+    else:
+        nb = op.num_batches
+        actual = args[-1]  # numpy array, dtype bfloat16
+        if nb > 1:
+            actual = actual.reshape(nb, op.M)[0]
+        expected = golden["C"]
+        errors = verify_buffer(
+            torch.from_numpy(actual.view(np.uint16)).view(torch.bfloat16),
+            "C",
+            expected,
+            rel_tol=rel_tol,
+            abs_tol=abs_tol,
+            max_error_rate=0.001,
+        )
+        correctness = "PASS" if not errors else f"FAIL ({len(errors)} mismatches)"
 
     physical_mlir = build_dir / f"{op.name}.mlir.prj" / "input_with_addresses.mlir"
     if not physical_mlir.exists():
@@ -274,6 +278,11 @@ def main() -> int:
                     help="relative tolerance for correctness check; default 0.04")
     ap.add_argument("--abs-tol", type=float, default=1e-3,
                     help="absolute tolerance for correctness check; default 1e-3")
+    ap.add_argument("--no-compute", action="store_true",
+                    help="link mv_nocompute.cc instead of mv.cc -- same FIFO/DMA "
+                         "pattern, zero compute. Reveals the structural BW ceiling "
+                         "of the GEMV's data movement layout. Output is meaningless, "
+                         "so correctness check is skipped.")
     ap.add_argument("--build-dir", default=None,
                     help="default = build_trace_gemv/<tag>/")
     ap.add_argument("--output-dir", default="trace",
@@ -330,6 +339,7 @@ def main() -> int:
         trace_size=args.trace_size,
         traced_worker_ids=(args.traced_worker,),
         col_offset=args.col_offset,
+        compute_disabled=args.no_compute,
         context=ctx,
     )
 
@@ -342,6 +352,7 @@ def main() -> int:
     info = time_and_trace(
         op, args.trace_size, build_dir, Path(args.output_dir), tag,
         n_warmup=args.n_warmup, rel_tol=args.rel_tol, abs_tol=args.abs_tol,
+        skip_correctness=args.no_compute,
     )
 
     bytes_per_call = sum(

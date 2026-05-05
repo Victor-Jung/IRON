@@ -13,7 +13,7 @@ from iron.common.test_utils import run_test
 def get_params():
     max_columns = aie_utils.get_current_device().cols
 
-    input_lengths = [1024, 2048, 4096, 8192]
+    input_lengths = [1024, 2048, 4096, 8192, 1048576]
     bypass_modes = [False, True]
 
     params = []
@@ -29,8 +29,8 @@ def get_params():
                         tile_size = input_length // num_cores
 
                         # Cap tile_size at 8192
-                        if tile_size > 8192:
-                            tile_size = 8192
+                        # if tile_size > 8192:
+                        #     tile_size = 8192
 
                         # Only proceed if tile_size * num_cores == input_length (exact division)
                         if tile_size * num_cores == input_length:
