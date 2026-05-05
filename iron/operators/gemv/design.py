@@ -9,6 +9,7 @@ from aie.dialects.aie import T
 from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron.device import Tile
 from aie.iron.placers import SequentialPlacer
 
 """
@@ -37,6 +38,9 @@ def my_matvec(
     kernel_object="mv.o",
     func_prefix="",
     verbose=False,
+    trace_size=0,
+    traced_worker_ids=None,
+    col_offset=0,
 ):
     if m_output is None:
         m_output = m_input
@@ -114,6 +118,18 @@ def my_matvec(
                 C_L1L3_fifo.release(1)
             B_L3L1_fifo.release(1)
 
+    # When col_offset > 0, every data fifo and shim DMA gets pinned to a
+    # specific column, leaving cols [0 .. col_offset-1] entirely free.  This
+    # is the workaround for trace routing: rt.enable_trace(routing="single")
+    # always lands trace traffic on column 0's shim, so col 0 must have no
+    # data DMAs.  Default col_offset=0 keeps the pre-existing auto-placed
+    # behaviour for production use.
+    def compute_tile(i):
+        return Tile(col_offset + i, 2)
+
+    def shim_tile(i):
+        return Tile(col_offset + i, 0)
+
     workers = [
         Worker(
             core_body,
@@ -123,6 +139,7 @@ def my_matvec(
                 C_L1L3_fifos[i].prod(),
                 matvec,
             ],
+            **({"placement": compute_tile(i)} if col_offset > 0 else {}),
         )
         for i in range(cols)
     ]
@@ -168,24 +185,37 @@ def my_matvec(
 
     rt = Runtime()
     with rt.sequence(L3_A_ty, L3_B_ty, L3_C_ty) as (A, B, C):
+        if trace_size > 0:
+            if traced_worker_ids is None:
+                traced_worker_ids = [0]
+            traced = [workers[i] for i in traced_worker_ids if i < len(workers)]
+            rt.enable_trace(trace_size, workers=traced, ddr_id=-1)
         rt.start(*workers)
         tg_b = rt.task_group()
         for col in range(cols):
             # Simple linear transfer of B, includes all batches in sequence
-            rt.fill(B_L3L1_fifos[col].prod(), B, B_tap, task_group=tg_b)
+            kwargs = {"placement": shim_tile(col)} if col_offset > 0 else {}
+            rt.fill(B_L3L1_fifos[col].prod(), B, B_tap, task_group=tg_b, **kwargs)
         for batch in range(num_batches):
             tg_ac = rt.task_group()
             for col in range(cols):
+                kwargs = {"placement": shim_tile(col)} if col_offset > 0 else {}
                 rt.fill(
-                    A_L3L1_fifos[col].prod(), A, A_taps[col][batch], task_group=tg_ac
+                    A_L3L1_fifos[col].prod(),
+                    A,
+                    A_taps[col][batch],
+                    task_group=tg_ac,
+                    **kwargs,
                 )
             for col in range(cols):
+                kwargs = {"placement": shim_tile(col)} if col_offset > 0 else {}
                 rt.drain(
                     C_L1L3_fifos[col].cons(),
                     C,
                     C_taps[col][batch],
                     task_group=tg_ac,
                     wait=True,
+                    **kwargs,
                 )
             rt.finish_task_group(tg_ac)
         rt.finish_task_group(tg_b)

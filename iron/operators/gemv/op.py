@@ -26,6 +26,17 @@ class GEMV(MLIROperator):
     tile_size_output: int | None = None
     num_batches: int = 1
     kernel_vector_size: int = field(default=64, repr=False)
+    # Tracing: when >0, configure the design to emit AIE trace packets to a
+    # buffer appended after the C output (ddr_id=-1 in rt.enable_trace), and
+    # grow the C arg spec by trace_size bytes so the host buffer is large
+    # enough.  Default 0 keeps the op fully backward-compatible.
+    trace_size: int = field(default=0, repr=False)
+    traced_worker_ids: tuple = field(default=(), repr=False)
+    # Shift worker + shim placement off column 0 so col 0 is reserved for
+    # the trace stream (rt.enable_trace(routing="single") forces all trace
+    # traffic onto col 0's shim, which collides with col 0's data DMAs).
+    # Default 0 keeps the production behavior.
+    col_offset: int = field(default=0, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -34,6 +45,7 @@ class GEMV(MLIROperator):
         "tile_size_input": "tsi",
         "tile_size_output": "tso",
         "num_batches": "batch",
+        "trace_size": "trace",
     }
 
     def __post_init__(self):
@@ -55,6 +67,16 @@ class GEMV(MLIROperator):
     def get_mlir_artifact(self):
         mlir_verbose = getattr(self.context, "mlir_verbose", False)
 
+        kwargs = {
+            "verbose": mlir_verbose,
+            "kernel_object": f"gemv_{self.K}k_{self.kernel_vector_size}vs.o",
+        }
+        if self.trace_size > 0:
+            kwargs["trace_size"] = self.trace_size
+            if self.traced_worker_ids:
+                kwargs["traced_worker_ids"] = list(self.traced_worker_ids)
+        if self.col_offset > 0:
+            kwargs["col_offset"] = self.col_offset
         return PythonGeneratedMLIRArtifact(
             f"{self.name}.mlir",
             DesignGenerator(
@@ -69,10 +91,7 @@ class GEMV(MLIROperator):
                     self.tile_size_output,
                     self.num_batches,
                 ),
-                {
-                    "verbose": mlir_verbose,
-                    "kernel_object": f"gemv_{self.K}k_{self.kernel_vector_size}vs.o",
-                },
+                kwargs,
             ),
         )
 
@@ -99,3 +118,7 @@ class GEMV(MLIROperator):
             AIERuntimeArgSpec("in", batch_dim + (self.K,)),  # vector
             AIERuntimeArgSpec("out", batch_dim + (self.M,)),  # output
         ]
+        # NOTE: when trace_size > 0 the C buffer is grown at runtime by
+        # load_and_run/prepare_args_for_trace (ddr_id=-1 path); we do NOT
+        # enlarge it here, otherwise the trace bytes land inside the
+        # prefix region that gets discarded.
